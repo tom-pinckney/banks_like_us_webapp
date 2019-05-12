@@ -1,0 +1,382 @@
+---
+title: "Bank  Clustering"
+author: "Tom Pinckney"
+date: "May 7, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Plan
+
+Initial research has shown that all banks are already clustered into peer groups
+
+* Use current peer groups as a starting point for bank clustering
+* Create a function that takes any bank as an input and outputs a ranking of peer group banks by similarity
+
+This allows us to select the 20 most similar banks for any peer group analysis we want to perform.
+
+## EDA
+
+First we'll explore the call data to get an idea of what we're dealing with
+```{r cars}
+library(tidyverse)
+library(here)
+
+# here creates an absolute path at time of evaluation making work more reproducible
+files <- list.files(here::here('data', 'raw', 'call_data_subset'))
+files <- files[!str_detect(files, "Readme")]
+
+data_list <- map(files, ~read_tsv(here::here('data', 'raw', 'call_data_subset', .x)))
+
+# The first row of the call data is really more column names we need to remove these and add them to the current names
+# We'll also remove NA and replace whitespace with _
+add_names <- function(df) {
+  names(df) <- str_replace_all(paste(colnames(df), as.character(unlist(df[1,]))), c(" NA" = "", " " = "_"))
+  df[-1,]
+}
+
+# fix the names by applying the function
+data_list <- map(data_list, add_names)
+
+# check
+head(data_list[[1]])
+```
+
+Now lets explore the content of the data
+
+```{r dimensions}
+# what are the dimensions of the data
+map(data_list, dim)
+```
+Same number of rows, different columns
+
+Lets combine the datasets into one 
+```{r join data}
+
+# both data sets have the same first 13 columns, we can join on those columns to get one dataset
+full_call_data <- data_list[[1]] %>% 
+  inner_join(data_list[[2]]) %>% 
+  rename_all(str_to_lower)
+
+dim(full_call_data)
+```
+Same number of rows as before.
+
+How many banks do we have
+```{r number of banks}
+n_distinct(full_call_data$idrssd)
+```
+
+There are multiple rows per bank lets see what these are
+
+```{r data}
+
+full_call_data %>% 
+  filter(financial_institution_name == .$financial_institution_name[2])
+```
+Each row is a different reporting period, to simplify the dataset we will do this as a snapshot in time and only look at Q4 2018. 
+
+```{r banks reporting each quarter}
+
+full_call_data %>% 
+    count(reporting_period_end_date)
+
+```
+
+We lose some banks that have not reported in Q4 yet but the difference is small. The plan is to create this analysis so that it could be repeated using any quarterly data.
+
+```{r}
+library(lubridate)
+
+# Filter to last quarter 2018
+call_data_q4 <- full_call_data %>% 
+  filter(reporting_period_end_date == date('2018-12-31'))
+
+# Check to see if number of rows == number of banks
+nrow(call_data_q4) == n_distinct(call_data_q4$fdic_certificate_number)
+```
+
+## Missing Values 
+
+Now lets dive into the content, what is the percent NA in all columns
+
+```{r}
+number_banks <- n_distinct(call_data_q4$fdic_certificate_number)
+
+missing_data <- call_data_q4 %>% 
+  summarise_all(~sum(is.na(.x))) %>% 
+  gather(column, n_missing, 1:ncol(.)) %>% 
+  mutate(percent_missing = n_missing / number_banks)
+
+missing_data %>% 
+  ggplot(aes(percent_missing)) +
+  geom_histogram()
+```
+A bunch of columns are missing more than 60% of the data. Due to my lack of subject matter knowledge I am just going to drop these columns instead of trying to determine if they are important. 
+
+I'm assuming these variables have to do with activities that some banks do not perform, or regulations that they are not subject to. This could be very useful information in clustering banks into groups. To maintain some of this information I will create a new feature number of columns with missing data for each bank.
+
+```{r remove mostly missing columns}
+columns_missing_less_60 <- missing_data %>% 
+  filter(percent_missing < 0.25) %>% 
+  select(column) %>% 
+  pull()
+
+cd_q4_non_missing <- call_data_q4 %>% 
+  mutate(n_missing = rowSums(is.na(call_data_q4))) %>% 
+  select(columns_missing_less_60, n_missing)
+  
+dim(cd_q4_non_missing)
+```
+Brings us down to a more manageable number. Lets see what the columns with missing values are
+
+```{r}
+cd_q4_non_missing %>%
+  summarise_all(funs(sum(is.na(.)))) %>% 
+  gather(column, na_values, 1:ncol(.)) %>% 
+  filter(na_values > 0)
+  
+```
+
+Lets see which banks have the missing values
+
+```{r banks with missing values}
+cd_q4_non_missing %>% 
+     filter(!complete.cases(.)) %>% 
+     select(financial_institution_name, n_missing, financial_institution_filing_type)
+```
+
+It is the same 76 banks that account for most of the missing values. They seem to be all the major banks in the US. Further all these banks except for FNB Bank have a filing type of 031. Filing type is likely a usefule varialbe for determining "Banks Like Us"
+
+## Lack of Spread
+
+Looking at the data shows that many of these column have mostly 0 values. Lets see if there are more columns we should ditch due to lack of information.
+
+```{r spread in columns}
+# Change columns to numeric
+n_banks <- n_distinct(cd_q4$fdic_certificate_number)
+
+cd_q4 <- cd_q4_non_missing %>% 
+  mutate_at(vars(contains("rcon")), as.numeric) %>% 
+  mutate_at(vars(contains("riad")), as.numeric)
+
+# count unique values in each column and how many non-zero entries there are
+var_data <- cd_q4 %>% 
+  summarise_if(is.numeric, ~sum(. != 0, na.rm = TRUE)) %>% 
+  gather(column, distinct_values, 1:ncol(.)) %>% 
+  inner_join(cd_q4 %>% 
+    summarise_if(is.numeric, ) %>% 
+    gather(column, non_zero_entries, 1:ncol(.)))
+
+var_data %>% 
+  ggplot(aes(distinct_values, non_zero_entries)) +
+  geom_point()
+
+```
+Plot shows a cluster of variables at the bottom left quadrant that have few distinct values and few non zero entries. We can probably drop several of these. We want to be careful though because even though they don't apply to many banks these variables may be very important to the banks they do apply to. I'll be very strict when dropping them and only drop vars that apply to fewer than 1% of banks.
+
+```{r vars to drop}
+
+vars_to_drop <- var_data %>% 
+  filter(non_zero_entries < (0.01 * n_banks)) %>% 
+  select(column) %>% 
+  pull()
+  
+cd_q4_selective <- cd_q4 %>% 
+  select(-vars_to_drop)
+```
+
+
+
+## Important Variables
+I'm going to create two distance matrices. One of variables I think I understand that I'm highly confident are important. These variables must be:
+
+* Easy to understand
+* Not contain missing values
+
+The other distance matrix will be created from all the other columns. When I combine the matrices I will weight the important matrix higher than the other matrix. 
+
+```{r searching for important variables}
+# Select columns with no missing data
+no_missing <- cd_q4 %>% 
+ select_if(~ !any(is.na(.)))
+
+# Columns containing total may likely be important
+colnames(no_missing)[str_detect(colnames(no_missing), "total")]
+```
+These all look important we will use them in our first distance matrix. Financial Institution filing type also seems important, we'll add that as well. 
+
+```{r select imp_vars}
+dm1_vars <- colnames(no_missing)[str_detect(colnames(no_missing), "total")]
+
+dm1_vars <- c(dm1_vars, "financial_institution_filing_type")
+```
+
+Now review the remaining columns to see if any stand out as important
+
+```{r}
+colnames(no_missing)
+```
+
+```{r add imp vars}
+# Adding these three variables. They seem to all be meta variables getting at the overall size of the bank and the information the bank reports. 
+dm1_vars <- c(dm1_vars, c("riad4340_net_income", "riad4135_salaries_and_employee_benefits", "n_missing", "riad4092_other_noninterest_expense", "riad4518_other_interest_income"))
+
+# These variables just contain identifying bank information
+bank_vars <- colnames(cd_q4)[1:13]
+
+dm2_vars <- colnames(cd_q4)[!colnames(cd_q4) %in% c(dm1_vars, bank_vars)]
+
+dm1_data <- cd_q4 %>% 
+  select(cert = fdic_certificate_number, dm1_vars)
+
+dm2_data <- cd_q4 %>% 
+  select(cert = fdic_certificate_number, dm2_vars)
+
+```
+
+
+### Data from other sources
+
+There are some other data sets found here https://banks.data.fdic.gov/docs/ that may provide some usefule information.
+
+```{r, other data}
+# Read in Data
+institutions <- read_csv(here::here('data', 'raw', 'institutions_locations', 'institutions.csv')) %>% 
+  rename_all(str_to_lower)
+
+
+# Filter to avtive institutions and subset to columns we want to use
+active_inst <- institutions %>% 
+  filter(active == 1) 
+
+# Reading the data dictionary provided on the website led to selecting the following columns
+dm1_inst_vars <- c("cert", "asset", "bkclass", "age", "fdicdbs", "roa", "roe", "offices", "mutual", "cb", "specgrpn")
+
+
+# Create an age variable and select important vars
+dm1_inst_data <- active_inst %>% 
+  mutate(age = as.numeric(today() - date(estymd)) / 365) %>%
+  select(imp_vars, age)
+```
+
+We'll now join this data back into our other data set. It appears that not all the banks in the call data are in the 
+institutions data set. Further investigation as to why that is the case would be good but is not timely. 
+
+```{r joining data}
+dim(dm1_inst_data)
+
+dim(dm1_data)
+
+dm1_data <- dm1_data %>% 
+  inner_join(dm1_inst_data)
+
+```
+Now lets create our first distance matrix. We have mixed data both categorical and numeric so we will use gowers distance
+
+```{r distance matrix}
+library(cluster)
+
+# convert columns to proper types
+dm1_data <- dm1_data %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(mutual = if_else(mutual == 1, TRUE, FALSE),
+         cb = if_else(cb == 1, TRUE, FALSE)
+         )
+
+dm1 <- as.matrix(daisy(dm1_data %>% 
+                         select(-cert) %>% 
+                         select_if(is.numeric), metric = 'euclidean'))
+
+rownames(dm1) <- dm1_data$cert
+colnames(dm1) <- dm1_data$cert
+
+# Convert to long dataframe add  names
+bank_names <- active_inst %>% 
+  select(cert, name, bank_class = bkclass)
+
+distance_long <- dm1 %>% 
+  as_tibble(rownames = "cert_1") %>% 
+  gather(cert_2, distance, 2:ncol(.)) %>% 
+  group_by(cert_1) %>% 
+  top_n(-100, distance) %>% 
+  filter(distance > 0) %>% 
+  ungroup() %>% 
+  mutate(cert_1 = as.numeric(cert_1),
+         cert_2 = as.numeric(cert_2)) %>% 
+  inner_join(bank_names %>% 
+               select(cert, name_1 = name, bank_class_1 = bank_class), by = c("cert_1" = "cert")) %>% 
+  inner_join(bank_names %>% 
+               select(cert, name_2 = name, bank_class_2 = bank_class), by = c("cert_2" = "cert"))
+  
+
+head(distance_long)
+```
+
+Lets see what banks this says are most similar and most dissimilar
+```{r most similar}
+distance_long %>% 
+  filter(distance > 0) %>% 
+  top_n(-10, distance)
+
+```
+```{r most disimilar}
+distance_long %>% 
+  filter(distance > 0) %>% 
+  top_n(10, distance)
+
+```
+Most similar to b of a
+```{r}
+distance_long %>% 
+  filter(name_1 == "BANK OF AMERICA, NATIONAL ASSOCIATION") %>% 
+  arrange(distance)
+```
+Seems to make sense
+
+Now lets make a function to return the n closest banks for any given FDIC cert
+
+```{r}
+
+get_similar_banks <- function(FDIC_certification_number, n_banks = 20, limit_to_bank_class = FALSE){
+  if(n_banks > 100){
+    stop("Cannot return more than 100 similar banks")
+  }
+  
+  if(!FDIC_certification_number %in% unique(distance_long$cert_1)){
+    stop("No bank with given FDIC Certification number found")
+  }
+  
+  if(limit_to_bank_class == TRUE){
+    
+    similar_banks <- distance_long %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      filter(bank_class_1 == bank_class_2) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }else{
+    
+    similar_banks <- distance_long %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }
+  
+  return(similar_banks)
+}
+```
+
+
+Save our data and clean up for report
+
+```{r outputs}
+
+write_csv(distance_long, here::here('data', 'clean', '00_bank_distances.csv'))
+
+```
+
