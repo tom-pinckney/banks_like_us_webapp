@@ -260,7 +260,7 @@ dm1_inst_vars <- c("cert", "asset", "bkclass", "age", "fdicdbs", "roa", "roe", "
 # Create an age variable and select important vars
 dm1_inst_data <- active_inst %>% 
   mutate(age = as.numeric(today() - date(estymd)) / 365) %>%
-  select(imp_vars, age)
+  select(dm1_inst_vars, age)
 ```
 
 We'll now join this data back into our other data set. It appears that not all the banks in the call data are in the 
@@ -272,7 +272,7 @@ dim(dm1_inst_data)
 dim(dm1_data)
 
 dm1_data <- dm1_data %>% 
-  inner_join(dm1_inst_data)
+  inner_join(dm1_inst_data, by = "cert")
 
 ```
 Now lets create our first distance matrix. We have mixed data both categorical and numeric so we will use gowers distance
@@ -375,6 +375,8 @@ get_similar_banks <- function(FDIC_certification_number, n_banks = 20, limit_to_
 Save our data and clean up for report
 
 ```{r outputs}
+input_data <- dm1_data %>% 
+  select_if(is.numeric)
 
 write_csv(distance_long, here::here('data', 'clean', '00_bank_distances.csv'))
 

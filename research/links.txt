@@ -2,3 +2,4 @@ links
 https://www.edgarsdatalab.com/2016/08/24/5-things-i-learned-from-open-banking-data/
 https://home.kpmg/xx/en/home/insights/2015/11/the-ecb-identification-peer-groups-fs.html
 https://www.abrigo.com/blog/2016/09/08/know-your-competition-best-practices-for-using-peer-bank-data/
+https://www.ffiec.gov/UBPR_memo_200311.htm

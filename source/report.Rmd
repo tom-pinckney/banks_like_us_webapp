@@ -1,0 +1,269 @@
+---
+title: "Banks Like This One"
+author: "Tom Pinckney"
+date: "May 11, 2019"
+output:
+  rmarkdown::html_document:
+    theme: cerulean
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Where would you start?
+
+I took three steps in starting this project
+
+1. Researched other bank clusterings / groupings [here](https://github.com/tom-pinckney/pl-assignment/tree/master/research)
+  + Discovered peer groups, bank classes and specialization groupings
+2. Limited starting data to a manageable subset
+  + Chose to use only call data subset from [bulk data download](https://cdr.ffiec.gov/public/PWS/DownloadBulkData.aspx)
+  + Discovered extensive institutions data set with other interesting variables [here](https://banks.data.fdic.gov/docs/)
+3. Did extensive EDA, review of variables, and multiple distance matrix methods on selected data sets [here](https://github.com/tom-pinckney/pl-assignment/blob/master/source/00_EDA.Rmd)
+  + Settled on using numeric variables that I understood (i.e. total deposits, number of branches) with euclidean distance
+  + Also decided to add an option to limit output within bank charter classes (as defined by FDIC [here](https://research.fdic.gov/bankfind/glossary.html))
+  
+This allowed me to create a simple but seemingly effective function that takes any bank FDIC certificate number and returns
+up to 100 of the most similar banks with an option to limit output to banks in the same charter class.
+
+Finally I took this function and the input data and put it in a shiny app allowing anyone to access this model without the 
+need for any code. 
+  
+  
+## Model Building
+
+There is massive amount of data at the FDIC bulk data download. Without subject matter knowledge it is very difficult to decide what
+is important and what is not. In the spirit of KISS (Keep It Simple Stupid) I chose to start with just the call data and another
+institutions data set that I discovered on the FDIC website. 
+```{r read in data, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+
+# Contains bank meta data updated regularly filter to only active institutions
+institutions <- read_csv(here::here('data', 'raw', 'institutions_locations', 'institutions.csv')) %>% 
+  rename_all(str_to_lower) %>% 
+  filter(active == 1)
+
+# Read in data sets in call_data folder
+files <- list.files(here::here('data', 'raw', 'call_data_subset'))
+files <- files[!str_detect(files, "Readme")]
+
+data_list <- map(files, ~read_tsv(here::here('data', 'raw', 'call_data_subset', .x)))
+
+# The first row of the call data is really more column names we need to remove these and add them to the current names
+# We'll also remove NA and replace whitespace with _
+add_names <- function(df) {
+  names(df) <- str_replace_all(paste(colnames(df), as.character(unlist(df[1,]))), c(" NA" = "", " " = "_"))
+  df[-1,]
+}
+
+# fix the names by applying the function
+data_list <- map(data_list, add_names)
+
+# Visual review shows these datasets have info about the same banks, join into one data set
+full_call_data <- data_list[[1]] %>% 
+  inner_join(data_list[[2]]) %>% 
+  rename_all(str_to_lower)
+
+# check
+print(paste("Dimensions call data", map(data_list, dim)))
+```
+
+There are multiple rows per bank in the call data set, one row for each quarter of 2018. We'll only use the most recent data from Q4. Another option could be to average columns across all four quarters. 
+
+```{r q4 2018, message=FALSE, warning=FALSE}
+library(lubridate)
+
+# Filter to Q4
+call_data_q4 <- full_call_data %>% 
+  filter(reporting_period_end_date == date('2018-12-31'))
+
+# Check to see if number of rows == number of banks
+nrow(call_data_q4) == n_distinct(call_data_q4$fdic_certificate_number)
+```
+
+For MVP 1 we are going to start with a simple solution and only use columns with no missing values that are easy to understand. For now we will drop the other columns. Some other ways we could use the other columns are:
+
+* Dimensionality reduction - Use PCA or other dimension reduction techniques
+* Subjet Matter Expertise - Have someone who understand this data well suggest what important information we're leaving out
+
+For now we'll just stick with the numeric columns we understand. 
+
+```{r selecting columns}
+
+# Missing data is likely meaningful since different types of banks have to report
+# different metrics. We'll keep some of 
+# the information from the missing data by creating a new column summing the number 
+# of missing columns for each bank
+call_data_selections <- call_data_q4 %>% 
+  mutate(n_missing = rowSums(is.na(call_data_q4))) %>% 
+  select(cert = fdic_certificate_number, rcon2200_total_deposits, riad4073_total_interest_expense, riad4079_total_noninterest_income, riad4093_total_noninterest_expense, riad4107_total_interest_income, riad4340_net_income, riad4135_salaries_and_employee_benefits, n_missing, riad4092_other_noninterest_expense, riad4518_other_interest_income) %>% 
+  mutate_all(as.numeric)
+
+# Reading the data dictionary provided for the institutions data set led me to select theses variables
+# Also creating a bank age variable
+institution_selections <- institutions %>% 
+  mutate(age = as.numeric(today() - date(estymd)) / 365) %>% 
+  select(cert, asset, age, roa, roe, offices)
+
+# Join data sets together, lost some banks in call data that are not in institutions data
+mod_data <- call_data_selections %>% 
+  inner_join(institution_selections, by = "cert")
+```
+
+
+Now we'll create a euclidean distance matrix using the columns we selected and convert it into a long dataframe for use in
+functions
+```{r distance matrix}
+library(cluster)
+
+dm <- daisy(mod_data %>% 
+              select(-cert), 
+            metric = 'euclidean') %>% 
+  as.matrix()
+
+
+rownames(dm) <- mod_data$cert
+colnames(dm) <- mod_data$cert
+
+# Convert to long data set for use in function
+# Limit to 100 closest banks for ease of use
+bank_similarities <- dm %>% 
+  as_tibble(rownames = "cert_1") %>% 
+  gather(cert_2, distance, 2:ncol(.)) %>% 
+  filter(distance > 0) %>% 
+  group_by(cert_1) %>% 
+  top_n(-100, distance)
+
+```
+
+
+Next we'll add on some bank meta data that can be used to identify and subset similar banks
+```{r add bank meta data}
+
+# Select other data we want to use 
+bank_meta <- institutions %>% 
+  mutate(cert = as.character(cert)) %>% 
+  select(cert, name_n = name, bank_class_n = bkclass, specialization_n = specgrpn)
+
+# Join it in to our similarities data set
+bank_similarities <- bank_similarities %>% 
+  inner_join(bank_meta %>% 
+               rename(name_1 = name_n,
+                      bank_class_1 = bank_class_n,
+                      specialization_1 = specialization_n),
+             by = c("cert_1" = "cert")) %>% 
+  inner_join(bank_meta %>% 
+               rename(name_2 = name_n,
+                      bank_class_2 = bank_class_n,
+                      specialization_2 = specialization_n),
+             by = c("cert_2" = "cert")) %>% 
+  select(cert_1, name_1, cert_2, name_2, distance, bank_class_1, bank_class_2, specialization_1, specialization_2)
+
+```
+
+Now definte a function to return similar banks to any given bank with an option to use bank class or specialization to limit 
+returned banks
+
+```{r function}
+get_similar_banks <- function(FDIC_certification_number, n_banks = 20, limit_to_bank_class = FALSE, limit_to_specialization = FALSE){
+  # Function returns list of similar banks as defined by our distance matrix for any FDIC certificate number
+  # limit_to_bank_class if TRUE limits results to banks in the same bank class
+  # limit_to_specialization if TRUE limits results to banks in the same specialization
+  
+  if(n_banks > 100){
+    stop("Cannot return more than 100 similar banks")
+  }
+  
+  if(!FDIC_certification_number %in% unique(bank_similarities$cert_1)){
+    stop("No bank with given FDIC Certification number found")
+  }
+  
+  FDIC_certification_number <- as.character(FDIC_certification_number)
+  
+  if(limit_to_bank_class == TRUE & limit_to_specialization == TRUE){
+    
+    similar_banks <- bank_similarities %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      filter(bank_class_1 == bank_class_2) %>% 
+      filter(specialization_1 == specialization_2) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }
+  
+  if(limit_to_bank_class == TRUE & limit_to_specialization == FALSE){
+    
+    similar_banks <- bank_similarities %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      filter(bank_class_1 == bank_class_2) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }
+  
+  if(limit_to_bank_class == FALSE & limit_to_specialization == TRUE){
+    
+    similar_banks <- bank_similarities %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      filter(specialization_1 == specialization_2) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }
+  
+  if(limit_to_bank_class == FALSE & limit_to_specialization == FALSE){
+    
+    similar_banks <- bank_similarities %>% 
+      filter(cert_1 == FDIC_certification_number) %>% 
+      arrange(distance) %>% 
+      slice(1:n_banks)
+    
+  }
+    
+  return(similar_banks)
+}
+
+```
+
+
+Lets try getting similar banks to Bank of America without using any of the other groupings and with the groupings
+```{r no groupings}
+get_similar_banks(3510, n_banks = 10) %>% 
+  kableExtra::kable() %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+This last one only returns 8 banks because there are only 8 other banks within the same class and specialization. 
+
+
+## Advice to Coworkers
+
+1. This model is only based on 16 variables and may not be fine tuned enough
+2. Get a subject matter expert to give feedback on whether or not the similar banks returned make sense
+
+
+## When Solution Should Not Be Used
+
+There are at least two scenerios where extreme caution should be taken when using thism odel
+
+1. If geography or market location is important this model should not be used. It currently does not take into account the actual location of any banks. 
+2. If a very small bank is asking for similar banks this model may not provide good reccomendations. The very large banks may have a large effect on the results of the model. 
+
+
+## Next Steps
+
+* Talk to subject matter experts to understand what's missing
+* Add other data into the model using dimension reduction
+* Add in some variables related to geography or market overlap between banks
+* Add other groupings to the function depending on potential use cases (i.e. FDIC peer group)
+
+
+## Homework Assignment Feedback
+
+* In general I actual appreciate
