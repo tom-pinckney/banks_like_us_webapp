@@ -22,4 +22,13 @@ shinyServer(function(input, output) {
     selectInput('fdic_certification_number', 'FDIC Certification Number', fdic_certs)
   })
 
+  output$table = DT::renderDataTable({
+
+    bank_similarities %>%
+      filter(cert_1 == as.numeric(input$bank_cert)) %>%
+      arrange(distance) %>%
+      slice(1:input$n_banks)
+
+  })
+
 })

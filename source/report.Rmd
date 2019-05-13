@@ -413,6 +413,8 @@ Notice the smaller banks show up much closer together than the large banks. This
 
 Our MVP model seems to work decently well. It allows us to get similar banks to any input bank, subset output by specific charter classes and specializations, and gives us a starting point to iterate and improve upon. 
 
+Finally a simple version of this model has been embedded in a web app [here](https://tpinckney27.shinyapps.io/banks-like-us-web-app). It does not have the categorical filtering options but will return them most similar banks for any given FDIC certificate number.
+
 
 ## Follow up Questions
 
@@ -439,7 +441,7 @@ There are at least two scenarios where extreme caution should be taken when usin
 * Talk to subject matter experts to understand what's missing
 * Add in some variables related to geography or market overlap between banks
 * Add in an auto select method for picking the number of similar banks
-* Embed the model in a web app to allow anyone at PrecisionLender to play with it and give me feedback
+* Clean up the web app
 * Find other sources of data to provide more variation
 * Add other groupings to the function depending on potential use cases
 
