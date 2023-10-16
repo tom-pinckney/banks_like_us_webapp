@@ -1,5 +1,4 @@
-# pl-assignment
-Take home assignment for Precision Lender application
+# Banks Like Us Web App
 
 `/source` - Contains all code
 
